@@ -1,0 +1,3 @@
+# pi supplies @earendil-works/* at runtime (peer dependencies). Never install
+# a second copy: tests and types use pi's own copy via `pnpm link-pi`.
+autoInstallPeers: false
