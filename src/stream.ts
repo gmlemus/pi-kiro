@@ -19,13 +19,13 @@ import {
   type ToolCall,
   type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import type { Catalog } from "./catalog.ts";
+import { kiroMeta, type ResolveProfile } from "./catalog.ts";
 import { buildConversation } from "./convert.ts";
 import { planReasoning } from "./effort.ts";
 import { classifyHttpError, KiroError, redact } from "./errors.ts";
 import { decodeEvent, type KiroEvent, type MetadataInfo, type StreamErrorInfo } from "./events.ts";
 import { EventStreamDecoder } from "./eventstream.ts";
-import { authHeaders, baseHeaders, fetchWithHeaderTimeout, sleep } from "./http.ts";
+import { authHeaders, baseHeaders, fetchWithHeaderTimeout, runtimeBase, sleep } from "./http.ts";
 import { InlineThinkingSplitter } from "./thinking.ts";
 import type { KiroChatRequest } from "./wire.ts";
 
@@ -47,7 +47,6 @@ export const policy = {
 
 const PROTECTED_HEADERS = new Set(["authorization", "tokentype", "content-type", "accept"]);
 
-type ResolveCatalog = () => Catalog | undefined;
 
 function zeroUsage(): AssistantMessage["usage"] {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -173,16 +172,18 @@ function streamErrorToKiroError(e: StreamErrorInfo): KiroError {
 
 const RETRYABLE_STREAM_KINDS = new Set(["rate", "server", "timeout"]);
 
-export function createStreamKiro(resolveCatalog: ResolveCatalog, fetchImpl: typeof fetch = (...a) => fetch(...a)) {
+export function createStreamKiro(resolveProfile: ResolveProfile, fetchImpl: typeof fetch = (...a) => fetch(...a)) {
   return function streamKiro(
     model: Model<Api>,
     context: TranscriptContext,
     options?: SimpleStreamOptions,
   ): AssistantMessageEventStream {
     const apiKey = options?.apiKey;
-    if (!apiKey) throw new Error("Kiro API key is not set. Export KIRO_API_KEY (a ksk_ key) before starting pi.");
+    if (!apiKey) {
+      throw new Error("Kiro API key is not set. Add it to ~/.pi/agent/auth.json (see the README) or export KIRO_API_KEY.");
+    }
     const stream = createAssistantMessageEventStream();
-    void run(model, context, options ?? {}, apiKey, stream, resolveCatalog, fetchImpl);
+    void run(model, context, options ?? {}, apiKey, stream, resolveProfile, fetchImpl);
     return stream;
   };
 }
@@ -193,7 +194,7 @@ async function run(
   options: SimpleStreamOptions,
   apiKey: string,
   stream: AssistantMessageEventStream,
-  resolveCatalog: ResolveCatalog,
+  resolveProfile: ResolveProfile,
   fetchImpl: typeof fetch,
 ): Promise<void> {
   const output: AssistantMessage = {
@@ -211,11 +212,14 @@ async function run(
   let started = false;
 
   try {
-    const catalog = resolveCatalog();
-    const info = catalog?.byPiId.get(model.id);
-    if (!catalog || !info) {
-      throw new KiroError("invalidRequest", `Model ${model.id} is not in this Kiro API key's model catalog`);
+    const info = kiroMeta(model);
+    if (!info) {
+      throw new KiroError(
+        "invalidRequest",
+        `Model ${model.id} is not in this Kiro API key's model catalog; run \`pi update --models\` to refresh it`,
+      );
     }
+    const profileArn = await resolveProfile(apiKey, info.region, signal);
     const level = model.reasoning ? options.reasoning : undefined;
     const plan = planReasoning(level, info.effort);
     if (plan.effort) output.providerThinkingLevel = plan.effort;
@@ -223,7 +227,7 @@ async function run(
 
     const conversation = buildConversation({
       messages: context.messages,
-      modelId: info.kiroId,
+      modelId: info.id,
       systemPrompt,
       tools: getCurrentTools(context.messages),
       contextWindow: model.contextWindow,
@@ -237,13 +241,13 @@ async function run(
         ...(conversation.history.length > 0 ? { history: conversation.history } : {}),
       },
       agentMode: "vibe",
-      profileArn: catalog.profileArn,
+      profileArn,
       ...(plan.additionalModelRequestFields ? { additionalModelRequestFields: plan.additionalModelRequestFields } : {}),
     } satisfies KiroChatRequest;
     const replaced = await options.onPayload?.(payload, model);
     if (replaced !== undefined) payload = replaced;
     const body = JSON.stringify(payload);
-    const url = new URL("generateAssistantResponse", catalog.runtimeBaseUrl).toString();
+    const url = new URL("generateAssistantResponse", runtimeBase(info.region)).toString();
     const splitThinking = level !== undefined;
 
     for (let attempt = 0; ; attempt++) {

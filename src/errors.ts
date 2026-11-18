@@ -153,7 +153,7 @@ export function classifyHttpError(status: number, body: string, headers: Headers
     return new KiroError(
       "auth",
       `Kiro rejected the API key during ${operation} (HTTP ${status}${parsed.type ? ` ${parsed.type}` : ""}). ` +
-        "Check that KIRO_API_KEY is valid, not expired, and issued for this region. " +
+        "Check that the Kiro API key is valid, not expired, and issued for this region. " +
         info,
       init,
     );

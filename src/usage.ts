@@ -1,6 +1,5 @@
 // Account credit usage (PROTOCOL.md §2.4).
 
-import type { Catalog } from "./catalog.ts";
 import { KiroError } from "./errors.ts";
 import { authHeaders, baseHeaders, fetchWithHeaderTimeout, managementBase, readJson } from "./http.ts";
 import { ORIGIN } from "./wire.ts";
@@ -62,12 +61,12 @@ export function parseUsage(body: unknown): CreditUsage {
 
 export async function fetchUsage(
   apiKey: string,
-  catalog: Pick<Catalog, "profileArn" | "region">,
+  profile: { profileArn: string; region: string },
   fetchImpl: typeof fetch = fetch,
   signal?: AbortSignal,
 ): Promise<CreditUsage> {
-  const url = new URL("Get-Usage-Limits", managementBase(catalog.region));
-  url.searchParams.set("profileArn", catalog.profileArn);
+  const url = new URL("Get-Usage-Limits", managementBase(profile.region));
+  url.searchParams.set("profileArn", profile.profileArn);
   url.searchParams.set("origin", ORIGIN);
   url.searchParams.set("resourceType", "CREDIT");
   url.searchParams.set("isEmailRequired", "false");

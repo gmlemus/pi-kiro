@@ -1,5 +1,5 @@
 import type { AssistantMessageEvent, AssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { buildCatalog, type Catalog } from "../src/catalog.ts";
+import { buildModels, type KiroModelConfig } from "../src/catalog.ts";
 import { encodeMessage } from "../src/eventstream.ts";
 
 export const PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:123456789012:profile/TEST";
@@ -68,8 +68,8 @@ export function fakeFetch(responders: Array<(call: Call) => Response | Promise<R
   return { impl, calls };
 }
 
-export function testCatalog(schema?: unknown): Catalog {
-  return buildCatalog(PROFILE_ARN, [
+export function testModel(schema?: unknown): KiroModelConfig {
+  const [model] = buildModels("us-east-1", [
     {
       modelId: "claude-sonnet-4.6",
       modelName: "Claude Sonnet 4.6",
@@ -78,6 +78,7 @@ export function testCatalog(schema?: unknown): Catalog {
       ...(schema ? { additionalModelRequestFieldsSchema: schema } : {}),
     },
   ]);
+  return model as KiroModelConfig;
 }
 
 export async function collect(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {

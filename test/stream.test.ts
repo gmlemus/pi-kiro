@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { beforeEach, test } from "node:test";
 import { type Api, type Model, normalizeContext, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { createStreamKiro, policy } from "../src/stream.ts";
-import { API_KEY, collect, event, exception, fakeFetch, headerOf, streamResponse, testCatalog } from "./helpers.ts";
+import { API_KEY, collect, event, exception, fakeFetch, headerOf, PROFILE_ARN, streamResponse, testModel } from "./helpers.ts";
 
-const catalog = testCatalog({
+const kiroModel = testModel({
   properties: { output_config: { properties: { effort: { enum: ["low", "medium", "high"] } } } },
 });
-const model = { ...(catalog.models[0] as object), provider: "kiro-secure" } as Model<Api>;
+const model = { ...kiroModel, provider: "kiro-secure" } as unknown as Model<Api>;
+const profile = async () => PROFILE_ARN;
 const ctx = normalizeContext({ systemPrompt: "Be brief.", messages: [{ role: "user", content: "hi", timestamp: 0 }] });
 
 beforeEach(() => {
@@ -25,7 +26,7 @@ beforeEach(() => {
 
 function run(responders: Parameters<typeof fakeFetch>[0], options: SimpleStreamOptions = {}) {
   const f = fakeFetch(responders);
-  const streamKiro = createStreamKiro(() => catalog, f.impl);
+  const streamKiro = createStreamKiro(profile, f.impl);
   return { events: collect(streamKiro(model, ctx, { apiKey: API_KEY, ...options })), calls: f.calls };
 }
 
@@ -55,7 +56,7 @@ test("text response: request shape, headers, events, usage", async () => {
   assert.equal(headerOf(call, "accept"), "application/vnd.amazon.eventstream");
   assert.match(headerOf(call, "user-agent") ?? "", /^pi-kiro-secure\//);
   const body = JSON.parse(String(call.init.body));
-  assert.equal(body.profileArn, catalog.profileArn);
+  assert.equal(body.profileArn, PROFILE_ARN);
   assert.equal(body.agentMode, "vibe");
   assert.equal(body.conversationState.currentMessage.userInputMessage.content, "Be brief.\n\nhi");
   assert.equal(body.conversationState.currentMessage.userInputMessage.modelId, "claude-sonnet-4.6");
@@ -259,9 +260,27 @@ test("a corrupted frame is a terminal protocol error", async () => {
 });
 
 test("missing API key throws synchronously; unknown model errors on the stream", async () => {
-  const streamKiro = createStreamKiro(() => catalog, fakeFetch([]).impl);
+  const streamKiro = createStreamKiro(profile, fakeFetch([]).impl);
   assert.throws(() => streamKiro(model, ctx, {}), /KIRO_API_KEY/);
-  const evs = await collect(streamKiro({ ...model, id: "nope" }, ctx, { apiKey: API_KEY }));
+  const evs = await collect(streamKiro({ ...model, kiro: undefined } as Model<Api>, ctx, { apiKey: API_KEY }));
   assert.equal(evs.length, 1);
   assert.match((evs[0] as { error: { errorMessage: string } }).error.errorMessage, /not in this Kiro API key's model catalog/);
+});
+
+test("profile lookup happens before start; its failure is a single redacted error, and the runtime host follows the model's region", async () => {
+  const failing = createStreamKiro(async () => {
+    throw new Error(`Kiro rejected ${API_KEY}`);
+  }, fakeFetch([]).impl);
+  const evs = await collect(failing(model, ctx, { apiKey: API_KEY }));
+  assert.deepEqual(evs.map((e) => e.type), ["error"]);
+  assert.ok(!JSON.stringify(evs).includes(API_KEY));
+
+  const f = fakeFetch([() => streamResponse([event("assistantResponseEvent", { content: "ok" })])]);
+  const regions: Array<string | undefined> = [];
+  const eu = { ...model, kiro: { ...kiroModel.kiro, region: "eu-central-1" } } as unknown as Model<Api>;
+  await collect(
+    createStreamKiro(async (_key, region) => (regions.push(region), PROFILE_ARN), f.impl)(eu, ctx, { apiKey: API_KEY }),
+  );
+  assert.deepEqual(regions, ["eu-central-1"]);
+  assert.equal(f.calls[0]?.url, "https://runtime.eu-central-1.kiro.dev/generateAssistantResponse");
 });

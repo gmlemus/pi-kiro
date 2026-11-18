@@ -33,19 +33,16 @@ interface CatalogModel {
   additionalModelRequestFieldsSchema?: unknown;
 }
 
-export interface ModelInfo {
-  kiroId: string;
+/** Kiro details carried on each pi model, so a cached catalog is self-contained. */
+export interface KiroMeta {
+  /** Kiro's own model ID (dot form), sent on the wire. */
+  id: string;
+  /** Region of the profile ARN; the runtime host lives there (§2.1, I10). */
+  region: string;
   effort?: EffortConfig;
 }
 
-export interface Catalog {
-  profileArn: string;
-  region: string;
-  runtimeBaseUrl: string;
-  models: ChatModelConfig[];
-  /** pi model id -> Kiro details. */
-  byPiId: Map<string, ModelInfo>;
-}
+export type KiroModelConfig = ChatModelConfig & { kiro: KiroMeta };
 
 /** Kiro's dot-form version (`4.6`) becomes pi's dash form (`4-6`). */
 export function toPiId(kiroId: string): string {
@@ -109,7 +106,7 @@ export async function getProfileArn(
   throw new KiroError(
     "auth",
     `Kiro rejected the API key in every region tried (${regions.join(", ")}). ` +
-      "Check that KIRO_API_KEY is valid and not revoked.",
+      "Check that the Kiro API key is valid and not revoked.",
     { status: rejection?.status, reason: rejection?.reason },
   );
 }
@@ -149,48 +146,159 @@ export async function listModels(
   return data.models as CatalogModel[];
 }
 
-export function buildCatalog(profileArn: string, raw: CatalogModel[]): Catalog {
-  const region = regionFromArn(profileArn) as string;
-  const runtimeBaseUrl = runtimeBase(region);
-  const models: ChatModelConfig[] = [];
-  const byPiId = new Map<string, ModelInfo>();
+export function buildModels(region: string, raw: CatalogModel[]): KiroModelConfig[] {
+  const models: KiroModelConfig[] = [];
+  const seen = new Set<string>();
   for (const m of raw) {
-    if (typeof m.modelId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(m.modelId)) continue;
+    if (typeof m.modelId !== "string" || !MODEL_ID.test(m.modelId)) continue;
     const id = toPiId(m.modelId);
-    if (byPiId.has(id)) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
     const effort = deriveEffortConfig(m.additionalModelRequestFieldsSchema);
     const types = Array.isArray(m.supportedInputTypes) ? m.supportedInputTypes : [];
     const vision = types.some((t) => typeof t === "string" && t.toUpperCase() === "IMAGE");
-    const thinkingLevelMap: Record<string, string> = {};
-    if (effort?.values.includes("xhigh")) thinkingLevelMap.xhigh = "xhigh";
-    if (effort?.values.includes("max")) thinkingLevelMap.max = "max";
-    models.push({
-      id,
-      name: typeof m.modelName === "string" && m.modelName ? m.modelName : m.modelId,
-      api: API,
-      baseUrl: runtimeBaseUrl,
-      // No capability flag is published; the thinking directive is harmless where unsupported.
-      reasoning: true,
-      ...(Object.keys(thinkingLevelMap).length > 0 ? { thinkingLevelMap } : {}),
-      input: vision ? ["text", "image"] : ["text"],
-      // Kiro bills credits, not per-token USD.
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: posInt(m.tokenLimits?.maxInputTokens) ?? DEFAULT_CONTEXT_WINDOW,
-      maxTokens: posInt(m.tokenLimits?.maxOutputTokens) ?? DEFAULT_MAX_TOKENS,
-    });
-    byPiId.set(id, effort ? { kiroId: m.modelId, effort } : { kiroId: m.modelId });
+    models.push(
+      toModelConfig({
+        id,
+        name: typeof m.modelName === "string" && m.modelName ? m.modelName : m.modelId,
+        vision,
+        contextWindow: posInt(m.tokenLimits?.maxInputTokens) ?? DEFAULT_CONTEXT_WINDOW,
+        maxTokens: posInt(m.tokenLimits?.maxOutputTokens) ?? DEFAULT_MAX_TOKENS,
+        kiro: effort ? { id: m.modelId, region, effort } : { id: m.modelId, region },
+      }),
+    );
   }
   if (models.length === 0) throw new KiroError("protocol", "Kiro ListAvailableModels returned no valid model IDs");
-  return { profileArn, region, runtimeBaseUrl, models, byPiId };
+  return models;
 }
 
-export async function discoverCatalog(
+const MODEL_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+
+interface ModelFacts {
+  id: string;
+  name: string;
+  vision: boolean;
+  contextWindow: number;
+  maxTokens: number;
+  kiro: KiroMeta;
+}
+
+/** Every derived field (host, API, cost, thinking map) is computed here, never taken from storage. */
+function toModelConfig(f: ModelFacts): KiroModelConfig {
+  const thinkingLevelMap: Record<string, string> = {};
+  if (f.kiro.effort?.values.includes("xhigh")) thinkingLevelMap.xhigh = "xhigh";
+  if (f.kiro.effort?.values.includes("max")) thinkingLevelMap.max = "max";
+  return {
+    id: f.id,
+    name: f.name,
+    api: API,
+    baseUrl: runtimeBase(f.kiro.region),
+    // No capability flag is published; the thinking directive is harmless where unsupported.
+    reasoning: true,
+    ...(Object.keys(thinkingLevelMap).length > 0 ? { thinkingLevelMap } : {}),
+    input: f.vision ? ["text", "image"] : ["text"],
+    // Kiro bills credits, not per-token USD.
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: f.contextWindow,
+    maxTokens: f.maxTokens,
+    kiro: f.kiro,
+  };
+}
+
+const rec = (v: unknown): Record<string, unknown> | undefined =>
+  v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+
+/** Validate the Kiro details on a model, whether built here or read back from pi's model store. */
+export function kiroMeta(model: unknown): KiroMeta | undefined {
+  const k = rec(rec(model)?.kiro);
+  if (!k || typeof k.id !== "string" || !MODEL_ID.test(k.id)) return undefined;
+  if (typeof k.region !== "string" || !isRegion(k.region)) return undefined;
+  const e = rec(k.effort);
+  const values = Array.isArray(e?.values) ? e.values.filter((v): v is string => typeof v === "string" && v.length > 0) : [];
+  if (e && (e.field === "reasoning" || e.field === "output_config") && values.length > 0) {
+    return { id: k.id, region: k.region, effort: { field: e.field, values, summarizedThinking: e.summarizedThinking === true } };
+  }
+  return { id: k.id, region: k.region };
+}
+
+/**
+ * Rebuild models from a stored snapshot. Only plain facts are read back; the
+ * runtime host, API and pricing are recomputed, so an edited store cannot point
+ * requests (and the API key) at another host.
+ */
+export function restoreModels(stored: readonly unknown[] | undefined): KiroModelConfig[] {
+  const out: KiroModelConfig[] = [];
+  const seen = new Set<string>();
+  for (const s of stored ?? []) {
+    const m = rec(s);
+    const kiro = kiroMeta(m);
+    if (!m || !kiro || m.api !== API) continue;
+    const id = toPiId(kiro.id);
+    if (m.id !== id || seen.has(id)) continue;
+    seen.add(id);
+    const input = Array.isArray(m.input) ? m.input : [];
+    out.push(
+      toModelConfig({
+        id,
+        name: typeof m.name === "string" && m.name ? m.name : kiro.id,
+        vision: input.includes("image"),
+        contextWindow: posInt(m.contextWindow) ?? DEFAULT_CONTEXT_WINDOW,
+        maxTokens: posInt(m.maxTokens) ?? DEFAULT_MAX_TOKENS,
+        kiro,
+      }),
+    );
+  }
+  return out;
+}
+
+export interface Discovery {
+  profileArn: string;
+  models: KiroModelConfig[];
+}
+
+export async function discoverModels(
   apiKey: string,
   fetchImpl: typeof fetch = fetch,
   regions: readonly string[] = KEY_REGIONS,
-): Promise<Catalog> {
-  const profileArn = await getProfileArn(apiKey, fetchImpl, regions);
+  signal?: AbortSignal,
+): Promise<Discovery> {
+  const profileArn = await getProfileArn(apiKey, fetchImpl, regions, signal);
   // Catalog and runtime both live in the profile's own region (§2.1, I10).
   const region = regionFromArn(profileArn) as string;
-  return buildCatalog(profileArn, await listModels(apiKey, profileArn, region, fetchImpl));
+  return { profileArn, models: buildModels(region, await listModels(apiKey, profileArn, region, fetchImpl, signal)) };
+}
+
+export type ResolveProfile = (apiKey: string, regionHint?: string, signal?: AbortSignal) => Promise<string>;
+
+export interface ProfileResolver {
+  get: ResolveProfile;
+  /** Remember an ARN found by discovery so the first chat skips a GetProfile round trip. */
+  seed(apiKey: string, profileArn: string): void;
+}
+
+/**
+ * The profile ARN contains the AWS account ID, so it is never written to pi's
+ * model store; it is looked up once per process and key, and kept in memory.
+ */
+export function createProfileResolver(fetchImpl: typeof fetch = fetch, preferredRegion?: () => string | undefined): ProfileResolver {
+  const cache = new Map<string, Promise<string>>();
+  return {
+    get(apiKey, regionHint, signal) {
+      let pending = cache.get(apiKey);
+      if (!pending) {
+        pending = (async () => {
+          const regions = keyRegions(preferredRegion?.());
+          const ordered = regionHint && isRegion(regionHint) ? [...new Set([regionHint, ...regions])] : regions;
+          return getProfileArn(apiKey, fetchImpl, ordered, signal);
+        })();
+        cache.set(apiKey, pending);
+        // A failed lookup (offline, aborted, revoked) must not stick for the process lifetime.
+        pending.catch(() => cache.delete(apiKey));
+      }
+      return pending;
+    },
+    seed(apiKey, profileArn) {
+      cache.set(apiKey, Promise.resolve(profileArn));
+    },
+  };
 }
